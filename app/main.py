@@ -597,7 +597,6 @@ def punch_out(body: PunchOutIn):
     if elapsed <= 0 or elapsed > 24 * 3600:
 
         raise HTTPException(422, "punch-out must be after punch-in and within 24 hours")
-
     derived = derived_fields(rec["status"], pin, ts, employee)
 
     updated = attendance.find_one_and_update({"_id": rec["_id"], "punch_out": None},
@@ -997,3 +996,133 @@ def department_trend(department: str, from_date: date = Query(..., alias="from")
                       "attendance_rate": 1, "moving_avg_7d": {"$cond": [{"$eq": ["$moving_avg_7d", None]}, None, mongo_round_half_up("$moving_avg_7d", 4)]}}},
 
         {"$sort": {"date": 1}}
+
+    ]
+
+    return {"department": department, "items": list(attendance.aggregate(pipeline))}
+
+
+
+# ---------- Explain endpoint ----------
+
+@app.get("/admin/explain/{endpoint}")
+
+def explain_endpoint(endpoint: str, emp_code: Optional[str] = None, month: Optional[str] = None,
+
+                     department: Optional[str] = None, limit: int = Query(10, ge=1, le=50),
+
+                     date_from: Optional[date] = None, date_to: Optional[date] = None, status: Optional[str] = None,
+
+                     page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+
+                     from_date: Optional[date] = Query(None, alias="from"), to: Optional[date] = None):
+
+    allowed = {"attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"}
+
+    if endpoint not in allowed:
+
+        raise HTTPException(422, f"endpoint must be one of {sorted(allowed)}")
+
+    if endpoint == "attendance_list":
+
+        if date_from and date_to and date_from > date_to: raise HTTPException(422, "date_from must be on or before date_to")
+
+        filt = {}
+
+        if emp_code: filt["emp_code"] = emp_code
+
+        if date_from or date_to:
+
+            filt["date"] = {}
+
+            if date_from: filt["date"]["$gte"] = date_from.isoformat()
+
+            if date_to: filt["date"]["$lte"] = date_to.isoformat()
+
+        if status: filt["status"] = status
+
+        # Explain exactly the find/sort/skip/limit operation used by GET /attendance.
+
+        command = {"find": "attendance_logs", "filter": filt, "sort": {"date": -1, "emp_code": 1}, "skip": (page-1)*page_size, "limit": page_size}
+
+        collection = "attendance_logs"
+
+    elif endpoint == "employee_monthly":
+
+        if not emp_code or not month: raise HTTPException(422, "emp_code and month are required")
+
+        start, end = date_range(month)
+
+        emp = employees.find_one({"emp_code": emp_code}, {"joined_on": 1})
+
+        if not emp: raise HTTPException(404, "Employee not found")
+
+        command = {"aggregate": "attendance_logs", "pipeline": employee_monthly_pipeline(emp_code, start, end, str(emp["joined_on"])), "cursor": {}}
+
+        collection = "attendance_logs"
+
+    elif endpoint == "department_summary":
+
+        if not month: raise HTTPException(422, "month is required")
+
+        start, end = date_range(month)
+
+        pipeline = [
+
+            {"$match": {"joined_on": {"$lte": end.isoformat()}, **({"department": department} if department else {})}},
+
+            {"$lookup": {"from": "attendance_logs", "let": {"code": "$emp_code"}, "pipeline": [{"$match": {"$expr": {"$and": [{"$eq": ["$emp_code", "$$code"]}, {"$gte": ["$date", start.isoformat()]}, {"$lte": ["$date", end.isoformat()]}]}}}], "as": "logs"}},
+
+            {"$project": {"_id": 0, "department": 1, "emp_code": 1, "logs": 1}}
+
+        ]
+
+        command = {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}
+
+        collection = "employees"
+
+    elif endpoint == "late_leaderboard":
+
+        if not month: raise HTTPException(422, "month is required")
+
+        start, end = date_range(month)
+
+        pipeline = [{"$match": {**month_match(start, end), "late_minutes": {"$gt": 0}}},
+
+                    {"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}, "late_count": {"$sum": 1}}},
+
+                    {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "employee"}}, {"$unwind": "$employee"}]
+
+        if department is not None: pipeline.append({"$match": {"employee.department": department}})
+
+        pipeline += [{"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}}, {"$match": {"rank": {"$lte": limit}}}]
+
+        command = {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}
+
+        collection = "attendance_logs"
+
+    else:
+
+        if not department or not from_date or not to: raise HTTPException(422, "department, from and to are required")
+
+        if to < from_date or (to-from_date).days >= 92: raise HTTPException(422, "Invalid trend date range")
+
+        pipeline = [{"$match": {"date": {"$gte": from_date.isoformat(), "$lte": to.isoformat()}}},
+
+                    {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "employee"}},
+
+                    {"$match": {"employee.department": department}}]
+
+        command = {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}
+
+        collection = "attendance_logs"
+
+    try:
+
+        result = client[db.name].command({"explain": command, "verbosity": "executionStats"})
+
+    except PyMongoError as exc:
+
+        raise HTTPException(500, f"Could not explain query: {exc.__class__.__name__}")
+
+    return {"endpoint": endpoint, "collection": collection, "explain": safe_json(result)}
